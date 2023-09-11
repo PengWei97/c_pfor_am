@@ -45,6 +45,7 @@ ComputeCrystalPlasticityStressDamage::validParams()
   params.addParam<Real>("reference_temperature",303.0,"reference temperature for thermal expansion");
   params.addParam<Real>("thermal_expansion",0.0,"Linear thermal expansion coefficient");
   params.addParam<Real>("dCTE_dT",0.0,"First derivative of the thermal expansion coefficient with respect to temperature");
+  params.addParam<bool>("suppress_constitutive_failure", false, "Use old values of pk2 and Fp if NR algorithm fails.");
   return params;
 }
 
@@ -81,7 +82,8 @@ ComputeCrystalPlasticityStressDamage::ComputeCrystalPlasticityStressDamage(
     _temperature(coupledValue("temperature")),
     _reference_temperature(getParam<Real>("reference_temperature")),
     _thermal_expansion(getParam<Real>("thermal_expansion")),
-    _dCTE_dT(getParam<Real>("dCTE_dT"))
+    _dCTE_dT(getParam<Real>("dCTE_dT")),
+    _suppress_constitutive_failure(getParam<bool>("suppress_constitutive_failure"))
 {
   _convergence_failed = false;
 }
@@ -267,8 +269,20 @@ ComputeCrystalPlasticityStressDamage::updateStress(RankTwoTensor & cauchy_stress
       }
     }
 
-    if (substep_iter > _max_substep_iter && _convergence_failed)
-      mooseException("ComputeMultipleCrystalPlasticityStress: Constitutive failure");
+    if (substep_iter > _max_substep_iter && _convergence_failed) {
+		
+      if (_suppress_constitutive_failure) {
+		  
+        _plastic_deformation_gradient[_qp] = _plastic_deformation_gradient_old[_qp];
+        _convergence_failed = false;
+		  
+	  } else {
+		  
+        mooseException("ComputeMultipleCrystalPlasticityStress: Constitutive failure");
+		  
+	  }
+	}
+      
   } while (_convergence_failed);
 
   postSolveQp(cauchy_stress, jacobian_mult);
@@ -370,7 +384,7 @@ ComputeCrystalPlasticityStressDamage::solveStateVariables()
       return;
 
     _plastic_deformation_gradient[_qp] =
-        _inverse_plastic_deformation_grad.inverse(); // the postSoveStress
+        _inverse_plastic_deformation_grad.inverse(); // the postSolveStress
 
     // Update slip system resistance and state variable after the stress has been finalized
     // We loop through all the models for each calculation
@@ -596,13 +610,28 @@ ComputeCrystalPlasticityStressDamage::calculateResidual()
   _residual_tensor = _pk2[_qp] - pk2_new;
 }
 
+// Jacobian for the Newton-Raphson crystal plasticity algorithm
+// includes damage
 void
 ComputeCrystalPlasticityStressDamage::calculateJacobian()
 {
   // may not need to cache the dfpinvdpk2 here. need to double check
   RankFourTensor dfedfpinv, deedfe, dfpinvdpk2, dfpinvdpk2_per_model;
+  
+  Real Je; // Je is relative elastic volume change
+  Real Je23; // Je^{2/3}
+  Real delta; // delta is the trace of volumetric part of elastic Green-Lagrange strain
 
   RankTwoTensor ffeiginv = _temporary_deformation_gradient * _inverse_eigenstrain_deformation_grad;
+  
+  RankTwoTensor ce, invce; // Green Lagrange elastic strain and its inverse
+  
+  // Derivative of second Piola-Kirchhoff stress with respect to the Green Lagrange elastic strain
+  // and its undamaged part
+  RankFourTensor dpk2dee;
+  RankFourTensor undamaged_dpk2dee;
+  
+  Real Kb = 0.0; // reference bulk modulus
 
   for (const auto i : make_range(Moose::dim))
     for (const auto j : make_range(Moose::dim))
@@ -626,11 +655,46 @@ ComputeCrystalPlasticityStressDamage::calculateJacobian()
         _num_eigenstrains);
     dfpinvdpk2 += dfpinvdpk2_per_model;
   }
+  
+  Je = _elastic_deformation_gradient.det();
+  
+  if (Je >= 1.0) { // expansion: dpk2dee = _D[_qp] * _elasticity_tensor[_qp]
+	
+    _jacobian = RankFourTensor::IdentityFour() - (_D[_qp] * _elasticity_tensor[_qp] * deedfe * dfedfpinv * dfpinvdpk2);
+	  
+  } else { // compression
+	  
+    ce = _elastic_deformation_gradient.transpose() * _elastic_deformation_gradient;
+    invce = ce.inverse();
+	  
+    for (unsigned int i = 0; i < LIBMESH_DIM; ++i)
+      for (unsigned int j = 0; j < LIBMESH_DIM; ++j)
+        Kb += _elasticity_tensor[_qp](i, i, j, j);
+  
+    Kb = Kb / 9.0;
+    
+    Je23 = std::pow(Je,2.0/3.0);
+    delta = 1.5 * (Je23 - 1.0);
+	  
+    // damaged part
+    for (const auto i : make_range(Moose::dim))
+      for (const auto j : make_range(Moose::dim))
+        for (const auto k : make_range(Moose::dim))
+          for (const auto l : make_range(Moose::dim))
+            undamaged_dpk2dee(i,j,k,l) = Kb * Je23 * (
+                                         (1.0 + (4.0/3.0) * delta) * invce(i,j) * invce(k,l)
+                                         - 2.0 * delta * invce(i,k) * invce(j,l)
+                                                     );
+            
+    dpk2dee = _D[_qp] * (_elasticity_tensor[_qp] - undamaged_dpk2dee);
+    
+    // undamaged part
+    dpk2dee += undamaged_dpk2dee;
+	
+    _jacobian = RankFourTensor::IdentityFour() - (dpk2dee * deedfe * dfedfpinv * dfpinvdpk2);	
 
-  _jacobian =
-      RankFourTensor::IdentityFour() - (_elasticity_tensor[_qp] * deedfe * dfedfpinv * dfpinvdpk2);
+  }
 }
-
 
 void
 ComputeCrystalPlasticityStressDamage::computeStrainVolumetric(Real & F_pos, Real & F_neg, 
@@ -772,12 +836,16 @@ ComputeCrystalPlasticityStressDamage::computeHistoryVariable(Real & F_pos, Real 
 
 }
 
+// update jacobian_mult by taking into account of the exact elasto-plastic tangent moduli
+// it includes damage
 void
 ComputeCrystalPlasticityStressDamage::elastoPlasticTangentModuli(RankFourTensor & jacobian_mult)
 {
   RankFourTensor tan_mod;
   RankTwoTensor pk2fet, fepk2, feiginvfpinv;
   RankFourTensor deedfe, dsigdpk2dfe, dfedf;
+  
+  const auto je = _elastic_deformation_gradient.det();
 
   // Fill in the matrix stiffness material property
   for (const auto i : make_range(Moose::dim))
@@ -789,9 +857,19 @@ ComputeCrystalPlasticityStressDamage::elastoPlasticTangentModuli(RankFourTensor 
       }
 
   usingTensorIndices(i_, j_, k_, l_);
-  dsigdpk2dfe = _elastic_deformation_gradient.times<i_, k_, j_, l_>(_elastic_deformation_gradient) *
-                _elasticity_tensor[_qp] * deedfe;
+  
+  if (je >= 1.0) { // expansion
+	  
+    dsigdpk2dfe = _elastic_deformation_gradient.times<i_, k_, j_, l_>(_elastic_deformation_gradient) *
+                  _D[_qp] * _elasticity_tensor[_qp] * deedfe;
 
+  } else { // compression
+	
+    dsigdpk2dfe = _elastic_deformation_gradient.times<i_, k_, j_, l_>(_elastic_deformation_gradient) *
+                  _elasticity_tensor[_qp] * deedfe;
+
+  }
+  
   pk2fet = _pk2[_qp] * _elastic_deformation_gradient.transpose();
   fepk2 = _elastic_deformation_gradient * _pk2[_qp];
 
@@ -805,7 +883,6 @@ ComputeCrystalPlasticityStressDamage::elastoPlasticTangentModuli(RankFourTensor 
 
   tan_mod += dsigdpk2dfe;
 
-  const auto je = _elastic_deformation_gradient.det();
   if (je > 0.0)
     tan_mod /= je;
 
